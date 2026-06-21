@@ -518,11 +518,6 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
     sel_all = ' selected' if range_preset == 'all' else ''
     sel_custom = ' selected' if range_preset == 'custom' else ''
     
-    days_options = "\n".join(
-        '<option value="{}"{}>{}</option>'.format(d, " selected" if d == today_date else "", d)
-        for d in available_days
-    )
-    
     gauge_pct = data.get("efficiency", 0)
     status_cls = "status-online" if data.get("status") == "Online" else "status-offline"
     
@@ -583,10 +578,8 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
         <h1>☀️ Solar Monitor</h1>
         <div style="margin-bottom: 16px;">
             <form method="get" action="./day" style="display: inline;">
-                <select name="date" onchange="this.form.submit()">
-                    <option value="">📅 Browse historical days...</option>
-''' + days_options + '''
-                </select>
+                <input type="date" name="date" value="" min="''' + (available_days[-1] if available_days else '') + '''" max="''' + today_date + '''" onchange="if(this.value) this.form.submit()" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:8px 12px;font-size:0.9rem;cursor:pointer;">
+                <span style="color:#64748b;font-size:0.8rem;margin-left:4px;">📅 Browse historical days</span>
             </form>
             <button id="install-btn" onclick="installPWA()" style="display: none; margin-left: 8px;">📲 Install</button>
             <form method="get" action="." style="display: inline; margin-left: 8px;">

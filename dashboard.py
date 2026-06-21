@@ -359,13 +359,15 @@ def mock_peak_data():
 
 
 def get_yesterday_energy():
+    """Get yesterday's total energy from live_readings (max energy_today for that day)."""
     yesterday = (now_ist().date() - timedelta(days=1)).strftime("%Y-%m-%d")
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    cursor.execute("SELECT energy_today FROM daily_summary WHERE date = ?", (yesterday,))
+    cursor.execute("SELECT MAX(energy_today) FROM live_readings WHERE date(timestamp) = ?", (yesterday,))
     row = cursor.fetchone()
     conn.close()
-    return row[0] if row else None
+    # Filter out bogus 0 values — if the max is 0, there were no real readings
+    return row[0] if row and row[0] and row[0] > 0 else None
 
 
 def format_yield_delta(today_kwh, yesterday_kwh):

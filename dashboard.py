@@ -87,8 +87,34 @@ def get_day_outages(target_date=None):
     return {"date": target_date, "count": len(outages), "outages": outages}
 
 
-def get_outage_history(days=7):
-    """Return outage summaries for the last N days."""
+def get_outage_history(days=7, start_date=None, end_date=None):
+    """Return outage summaries for a date range or last N days."""
+    if start_date and end_date:
+        # Single query for the entire range, then group by day (efficient for large ranges)
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT timestamp, power_now FROM live_readings
+            WHERE date(timestamp) BETWEEN ? AND ?
+            ORDER BY timestamp
+        """, (start_date, end_date))
+        all_rows = c.fetchall()
+        conn.close()
+
+        from collections import defaultdict
+        day_rows = defaultdict(list)
+        for ts, power in all_rows:
+            day = ts[:10]  # YYYY-MM-DD
+            day_rows[day].append((ts, power))
+
+        results = []
+        # Return newest-first to maintain backward compatibility
+        for day in sorted(day_rows.keys(), reverse=True):
+            outages = detect_outages(day_rows[day])
+            results.append({"date": day, "count": len(outages), "outages": outages})
+        return results
+
+    # Fallback: day-by-day for small N-days queries
     results = []
     for i in range(days):
         d = (datetime.now(IST).date() - timedelta(days=i)).strftime("%Y-%m-%d")
@@ -97,9 +123,9 @@ def get_outage_history(days=7):
     return results
 
 
-def get_outage_chart_data(days=14):
+def get_outage_chart_data(days=14, start_date=None, end_date=None):
     """Return labels and minutes arrays for outage history chart."""
-    history = get_outage_history(days)
+    history = get_outage_history(days, start_date, end_date)
     labels = []
     minutes = []
     counts = []
@@ -220,23 +246,31 @@ def get_day_curve(target_date=None):
     return labels, data, len(rows)
 
 
-def get_daily_history(days=14):
-    """Get last N days of daily energy from live_readings (max energy_today per day)."""
+def get_daily_history(days=14, start_date=None, end_date=None):
+    """Get daily energy from live_readings (max energy_today per day)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT date(timestamp) as day, MAX(energy_today) as max_energy
-        FROM live_readings
-        WHERE date(timestamp) >= date('now', '-{} days')
-        GROUP BY day
-        ORDER BY day DESC
-        LIMIT ?
-    """.format(days), (days,))
+
+    if start_date and end_date:
+        cursor.execute("""
+            SELECT date(timestamp) as day, MAX(energy_today) as max_energy
+            FROM live_readings
+            WHERE date(timestamp) BETWEEN ? AND ?
+            GROUP BY day
+            ORDER BY day
+        """, (start_date, end_date))
+    else:
+        cursor.execute("""
+            SELECT date(timestamp) as day, MAX(energy_today) as max_energy
+            FROM live_readings
+            WHERE date(timestamp) >= date('now', '-{} days')
+            GROUP BY day
+            ORDER BY day
+        """.format(days))
+
     rows = cursor.fetchall()
     conn.close()
-    
-    rows = list(reversed(rows))
+
     labels = [r[0][5:] for r in rows]  # MM-DD
     data = [r[1] or 0 for r in rows]
     return labels, data
@@ -298,31 +332,41 @@ def get_available_days():
     return rows
 
 
-def get_weekly_data():
+def get_weekly_data(days=30, start_date=None, end_date=None):
     """Get weekly energy totals from live_readings (max energy_today per day, summed by week)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    
-    cursor.execute("""
-        SELECT 
-            week,
-            SUM(daily_max) as weekly_energy
-        FROM (
-            SELECT 
-                strftime('%Y-W%W', date(timestamp)) as week,
-                MAX(energy_today) as daily_max
-            FROM live_readings
-            WHERE date(timestamp) >= date('now', '-30 days')
-            GROUP BY date(timestamp)
-        )
-        GROUP BY week
-        ORDER BY week DESC
-        LIMIT 4
-    """)
+
+    if start_date and end_date:
+        cursor.execute("""
+            SELECT week, SUM(daily_max) as weekly_energy
+            FROM (
+                SELECT strftime('%Y-W%W', date(timestamp)) as week,
+                       MAX(energy_today) as daily_max
+                FROM live_readings
+                WHERE date(timestamp) BETWEEN ? AND ?
+                GROUP BY date(timestamp)
+            )
+            GROUP BY week
+            ORDER BY week
+        """, (start_date, end_date))
+    else:
+        cursor.execute("""
+            SELECT week, SUM(daily_max) as weekly_energy
+            FROM (
+                SELECT strftime('%Y-W%W', date(timestamp)) as week,
+                       MAX(energy_today) as daily_max
+                FROM live_readings
+                WHERE date(timestamp) >= date('now', '-{} days')
+                GROUP BY date(timestamp)
+            )
+            GROUP BY week
+            ORDER BY week
+        """.format(days))
+
     rows = cursor.fetchall()
     conn.close()
-    
-    rows = list(reversed(rows))
+
     labels = [r[0] for r in rows]
     data = [r[1] or 0 for r in rows]
     return labels, data
@@ -390,9 +434,63 @@ def format_yield_delta(today_kwh, yesterday_kwh):
     return f'<div class="yield-delta yield-down">↓ {delta:.1f} kWh vs yesterday</div>'
 
 
+def get_available_date_range():
+    """Return (min_date, max_date) from live_readings, or (today, today) if empty."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT MIN(date(timestamp)), MAX(date(timestamp)) FROM live_readings")
+    row = cursor.fetchone()
+    conn.close()
+    min_date = row[0] if row and row[0] else today_ist()
+    max_date = row[1] if row and row[1] else today_ist()
+    return min_date, max_date
 
 
-def build_main_page(data, power_labels, power_data, daily_labels, daily_data, weekly_labels, weekly_data, available_days, peak_labels, peak_data, yesterday_kwh=None, outage_labels=None, outage_minutes=None, outage_counts=None, days=14):
+def resolve_range(params):
+    """Convert frontend range preset to (start_date, end_date, range_label, range_preset)."""
+    preset = params.get("range", "14d")
+    today = today_ist()
+
+    if preset == "custom":
+        start = params.get("start", today)
+        end = params.get("end", today)
+        if start > end:
+            start, end = end, start
+        label = f"{start} to {end}"
+        return start, end, label, preset
+
+    if preset == "7d":
+        start = (now_ist().date() - timedelta(days=6)).strftime("%Y-%m-%d")
+        return start, today, "Last 7 Days", preset
+    if preset == "14d":
+        start = (now_ist().date() - timedelta(days=13)).strftime("%Y-%m-%d")
+        return start, today, "Last 14 Days", preset
+    if preset == "1m":
+        start = (now_ist().date() - timedelta(days=29)).strftime("%Y-%m-%d")
+        return start, today, "Last 30 Days", preset
+    if preset == "6m":
+        start = (now_ist().date() - timedelta(days=182)).strftime("%Y-%m-%d")
+        return start, today, "Last 6 Months", preset
+    if preset == "1y":
+        start = (now_ist().date() - timedelta(days=364)).strftime("%Y-%m-%d")
+        return start, today, "Last Year", preset
+    if preset == "5y":
+        start = (now_ist().date() - timedelta(days=1825)).strftime("%Y-%m-%d")
+        return start, today, "Last 5 Years", preset
+    if preset == "ytd":
+        year = today[:4]
+        start = f"{year}-01-01"
+        return start, today, "Year to Date", preset
+    if preset == "all":
+        start, end = get_available_date_range()
+        return start, end, "All Time", preset
+
+    # Default: 14 days
+    start = (now_ist().date() - timedelta(days=13)).strftime("%Y-%m-%d")
+    return start, today, "Last 14 Days", "14d"
+
+
+def build_main_page(data, power_labels, power_data, daily_labels, daily_data, weekly_labels, weekly_data, available_days, peak_labels, peak_data, yesterday_kwh=None, outage_labels=None, outage_minutes=None, outage_counts=None, days=14, range_label="Last 14 Days", range_preset="14d", start_date=None, end_date=None):
     pl = json.dumps(power_labels)
     pd = json.dumps(power_data)
     dl = json.dumps(daily_labels)
@@ -407,6 +505,18 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
     oc = json.dumps(outage_counts) if outage_counts else "[]"
     yield_delta = format_yield_delta(data.get("today_kwh", 0), yesterday_kwh)
     today_date = today_ist()
+    start_val = start_date or today_date
+    end_val = end_date or today_date
+    
+    sel_7d = ' selected' if range_preset == '7d' else ''
+    sel_14d = ' selected' if range_preset == '14d' else ''
+    sel_1m = ' selected' if range_preset == '1m' else ''
+    sel_6m = ' selected' if range_preset == '6m' else ''
+    sel_1y = ' selected' if range_preset == '1y' else ''
+    sel_5y = ' selected' if range_preset == '5y' else ''
+    sel_ytd = ' selected' if range_preset == 'ytd' else ''
+    sel_all = ' selected' if range_preset == 'all' else ''
+    sel_custom = ' selected' if range_preset == 'custom' else ''
     
     days_options = "\n".join(
         '<option value="{}"{}>{}</option>'.format(d, " selected" if d == today_date else "", d)
@@ -479,7 +589,35 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
                 </select>
             </form>
             <button id="install-btn" onclick="installPWA()" style="display: none; margin-left: 8px;">📲 Install</button>
+            <form method="get" action="." style="display: inline; margin-left: 8px;">
+                <select name="range" onchange="handleRangeChange(this)">
+                    <option value="7d"''' + sel_7d + '''>7 Days</option>
+                    <option value="14d"''' + sel_14d + '''>14 Days</option>
+                    <option value="1m"''' + sel_1m + '''>1 Month</option>
+                    <option value="6m"''' + sel_6m + '''>6 Months</option>
+                    <option value="1y"''' + sel_1y + '''>1 Year</option>
+                    <option value="5y"''' + sel_5y + '''>5 Years</option>
+                    <option value="ytd"''' + sel_ytd + '''>YTD</option>
+                    <option value="all"''' + sel_all + '''>All Time</option>
+                    <option value="custom"''' + sel_custom + '''>Custom Range</option>
+                </select>
+                <span id="custom-range" style="display: none; margin-left: 4px;">
+                    <input type="date" name="start" value="''' + start_val + '''" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.85rem;">
+                    <span style="color:#64748b;">to</span>
+                    <input type="date" name="end" value="''' + end_val + '''" style="background:#1e293b;color:#e2e8f0;border:1px solid #334155;border-radius:6px;padding:6px 8px;font-size:0.85rem;">
+                </span>
+                <button type="submit" style="padding: 6px 12px; margin-left: 4px; font-size: 0.8rem;">Apply</button>
+            </form>
             <span style="color: #64748b; font-size: 0.8rem; margin-left: 8px;">IST (UTC+5:30)</span>
+            <script>
+                function handleRangeChange(select) {
+                    document.getElementById('custom-range').style.display = select.value === 'custom' ? 'inline' : 'none';
+                }
+                // Initialize on load
+                if (document.querySelector('select[name="range"]')) {
+                    handleRangeChange(document.querySelector('select[name="range"]'));
+                }
+            </script>
         </div>
         <div class="hero">
             <div class="gauge-container">
@@ -521,13 +659,10 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
         </div>
         <div class="charts-grid">
             <div class="chart-card"><div class="chart-title">Today's Power Curve</div><canvas id="powerChart" height="120"></canvas></div>
-            <div class="chart-card"><div class="chart-title">Daily Energy (Last ''' + str(days) + ''' Days)</div><canvas id="dailyChart" height="120"></canvas></div>
-            <div class="chart-card"><div class="chart-title">Weekly Totals</div><canvas id="weeklyChart" height="120"></canvas></div>
+            <div class="chart-card"><div class="chart-title">Daily Energy (''' + range_label + ''')</div><canvas id="dailyChart" height="120"></canvas></div>
+            <div class="chart-card"><div class="chart-title">Weekly Totals (''' + range_label + ''')</div><canvas id="weeklyChart" height="120"></canvas></div>
             <div class="chart-card"><div class="chart-title">Peak Hours Analysis</div><canvas id="peakChart" height="120"></canvas></div>
-        </div>
-        <div class="chart-card" style="margin-bottom: 16px;">
-            <div class="chart-title">Outage History</div>
-            <canvas id="outageChart" height="100"></canvas>
+            <div class="chart-card"><div class="chart-title">Outage History (''' + range_label + ''')</div><canvas id="outageChart" height="80"></canvas></div>
         </div>
         <p class="info-footer">Last update: ''' + str(data.get("timestamp", "")) + ''' | Plant ID: 1250826 | SN: KSY0424HT3322<br><a href="./outages" style="color: #64748b;">View full outage log →</a></p>
     </div>
@@ -557,7 +692,7 @@ def build_main_page(data, power_labels, power_data, daily_labels, daily_data, we
     return html
 
 
-def build_outages_page(history, total_minutes, avg_per_day, max_day, days=14):
+def build_outages_page(history, total_minutes, avg_per_day, max_day, days=14, range_label="Last 14 Days"):
     rows = []
     for h in history:
         for o in h["outages"]:
@@ -569,7 +704,7 @@ def build_outages_page(history, total_minutes, avg_per_day, max_day, days=14):
         table_rows = "\n".join('<tr><td style="padding:10px 8px;border-bottom:1px solid #1e293b;">{}</td><td style="padding:10px 8px;border-bottom:1px solid #1e293b;">{}</td><td style="padding:10px 8px;border-bottom:1px solid #1e293b;">{}</td><td style="padding:10px 8px;border-bottom:1px solid #1e293b;">{:.0f} min</td><td style="padding:10px 8px;border-bottom:1px solid #1e293b;">{:.0f}W</td></tr>'.format(r["date"], r["start"], r["end"], r["duration_min"], r["pre_power"]) for r in rows)
     else:
         table_rows = '<tr><td colspan="5" style="text-align:center;padding:30px;color:#64748b;">No outages recorded</td></tr>'
-    return '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Power Outages - Solar Monitor</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><style>*{margin:0;padding:0;box-sizing:border-box;}body{background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;padding:20px;}.header{text-align:center;margin-bottom:24px;}.header h1{font-size:1.6rem;color:#fbbf24;}.subtitle{color:#94a3b8;font-size:0.85rem;}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px;}.stat-card{background:#1e293b;border-radius:12px;padding:16px;text-align:center;}.stat-label{color:#94a3b8;font-size:0.75rem;text-transform:uppercase;margin-bottom:6px;}.stat-value{font-size:1.4rem;font-weight:700;color:#fbbf24;}.chart-card{background:#1e293b;border-radius:12px;padding:16px;margin-bottom:20px;}.chart-title{font-size:0.85rem;color:#94a3b8;margin-bottom:12px;}table{width:100%;border-collapse:collapse;font-size:0.85rem;}th{text-align:left;padding:10px 8px;color:#94a3b8;border-bottom:2px solid #334155;font-weight:600;}a{color:#fbbf24;text-decoration:none;}.back{display:inline-block;margin-bottom:16px;color:#94a3b8;}</style></head><body><a href="." class="back">&larr; Back to Dashboard</a><div class="header"><h1>Power Outages</h1><p class="subtitle">Chauhan Residence | Last ''' + str(days) + ''' Days</p></div><div class="stats"><div class="stat-card"><div class="stat-label">Total Outages</div><div class="stat-value">''' + str(len(rows)) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">events</span></div></div><div class="stat-card"><div class="stat-label">Total Duration</div><div class="stat-value">''' + '{:.0f}'.format(total_minutes) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">min</span></div></div><div class="stat-card"><div class="stat-label">Avg per Day</div><div class="stat-value">''' + '{:.1f}'.format(avg_per_day) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">outages</span></div></div><div class="stat-card"><div class="stat-label">Worst Day</div><div class="stat-value">''' + str(max_day) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">events</span></div></div></div><div class="chart-card"><div class="chart-title">Outage History (Minutes)</div><canvas id="outageChart"></canvas></div><div class="chart-card"><div class="chart-title">Detailed Log</div><table><thead><tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Pre-Power</th></tr></thead><tbody>''' + table_rows + '''</tbody></table></div><script>const outColors=''' + oc + '''.map(c=>c>0?'#ef4444':'#334155');new Chart(document.getElementById('outageChart').getContext('2d'),{type:'bar',data:{labels:''' + ol + ''',datasets:[{label:'Minutes',data:''' + om + ''',backgroundColor:outColors,borderRadius:4}]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:(ctx)=>{const c=''' + oc + '''[ctx.dataIndex];const m=ctx.raw;if(m===0)return'No outages';return c+' cut(s), '+m+' min ('+(m/60).toFixed(1)+'h)';}}}},scales:{y:{beginAtZero:true,display:false},x:{ticks:{maxTicksLimit:14,font:{size:10}}}}}});</script></body></html>'''
+    return '''<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Power Outages - Solar Monitor</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script><style>*{margin:0;padding:0;box-sizing:border-box;}body{background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,\'Segoe UI\',Roboto,sans-serif;padding:20px;}.header{text-align:center;margin-bottom:24px;}.header h1{font-size:1.6rem;color:#fbbf24;}.subtitle{color:#94a3b8;font-size:0.85rem;}.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:24px;}.stat-card{background:#1e293b;border-radius:12px;padding:16px;text-align:center;}.stat-label{color:#94a3b8;font-size:0.75rem;text-transform:uppercase;margin-bottom:6px;}.stat-value{font-size:1.4rem;font-weight:700;color:#fbbf24;}.chart-card{background:#1e293b;border-radius:12px;padding:16px;margin-bottom:20px;}.chart-title{font-size:0.85rem;color:#94a3b8;margin-bottom:12px;}table{width:100%;border-collapse:collapse;font-size:0.85rem;}th{text-align:left;padding:10px 8px;color:#94a3b8;border-bottom:2px solid #334155;font-weight:600;}a{color:#fbbf24;text-decoration:none;}.back{display:inline-block;margin-bottom:16px;color:#94a3b8;}</style></head><body><a href="." class="back">&larr; Back to Dashboard</a><div class="header"><h1>Power Outages</h1><p class="subtitle">Chauhan Residence | ''' + range_label + '''</p></div><div class="stats"><div class="stat-card"><div class="stat-label">Total Outages</div><div class="stat-value">''' + str(len(rows)) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">events</span></div></div><div class="stat-card"><div class="stat-label">Total Duration</div><div class="stat-value">''' + '{:.0f}'.format(total_minutes) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">min</span></div></div><div class="stat-card"><div class="stat-label">Avg per Day</div><div class="stat-value">''' + '{:.1f}'.format(avg_per_day) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">outages</span></div></div><div class="stat-card"><div class="stat-label">Worst Day</div><div class="stat-value">''' + str(max_day) + '''<span style="color:#64748b;font-size:0.85rem;margin-left:2px;">events</span></div></div></div><div class="chart-card"><div class="chart-title">Outage History (Minutes)</div><canvas id="outageChart"></canvas></div><div class="chart-card"><div class="chart-title">Detailed Log</div><table><thead><tr><th>Date</th><th>Start</th><th>End</th><th>Duration</th><th>Pre-Power</th></tr></thead><tbody>''' + table_rows + '''</tbody></table></div><script>const outColors=''' + oc + '''.map(c=>c>0?'#ef4444':'#334155');new Chart(document.getElementById('outageChart').getContext('2d'),{type:'bar',data:{labels:''' + ol + ''',datasets:[{label:'Minutes',data:''' + om + ''',backgroundColor:outColors,borderRadius:4}]},options:{responsive:true,plugins:{legend:{display:false},tooltip:{callbacks:{label:(ctx)=>{const c=''' + oc + '''[ctx.dataIndex];const m=ctx.raw;if(m===0)return'No outages';return c+' cut(s), '+m+' min ('+(m/60).toFixed(1)+'h)';}}}},scales:{y:{beginAtZero:true,display:false},x:{ticks:{maxTicksLimit:14,font:{size:10}}}}}});</script></body></html>'''
 
 
 def build_day_page(date, labels, data, outages, summary, prev_day, next_day, available_days):
@@ -601,7 +736,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
         # Removed auth check - open access
         
         if path in ("./", "/", "/index.html", "/solar", "/solar/"):
-            days = int(params.get("days", "14"))
+            start_date, end_date, range_label, range_preset = resolve_range(params)
+            days = (datetime.strptime(end_date, "%Y-%m-%d").date() - datetime.strptime(start_date, "%Y-%m-%d").date()).days + 1
             data = get_latest_data()
             if not data:
                 self.send_response(200)
@@ -612,18 +748,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             
             power_labels, power_data, _ = get_day_curve()
-            daily_labels, daily_data = get_daily_history(days)
-            weekly_labels, weekly_data = get_weekly_data()
+            daily_labels, daily_data = get_daily_history(start_date=start_date, end_date=end_date)
+            weekly_labels, weekly_data = get_weekly_data(start_date=start_date, end_date=end_date)
             peak_labels, peak_data, _ = get_hourly_averages()
             if not peak_data or not any(peak_data):
                 peak_labels, peak_data = mock_peak_data()
             available_days = get_available_days()
-            outage_labels, outage_minutes, outage_counts = get_outage_chart_data(days)
+            outage_labels, outage_minutes, outage_counts = get_outage_chart_data(start_date=start_date, end_date=end_date)
             yesterday_kwh = get_yesterday_energy()
             
             html = build_main_page(data, power_labels, power_data, daily_labels, daily_data,
                                    weekly_labels, weekly_data, available_days, peak_labels, peak_data,
-                                   yesterday_kwh, outage_labels, outage_minutes, outage_counts, days)
+                                   yesterday_kwh, outage_labels, outage_minutes, outage_counts,
+                                   days=days, range_label=range_label, range_preset=range_preset,
+                                   start_date=start_date, end_date=end_date)
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -653,14 +791,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(html.encode("utf-8"))
 
         elif path.startswith("/outages"):
-            days = int(params.get("days", "14"))
-            history = get_outage_history(days)
+            start_date, end_date, range_label, _ = resolve_range(params)
+            days = (datetime.strptime(end_date, "%Y-%m-%d").date() - datetime.strptime(start_date, "%Y-%m-%d").date()).days + 1
+            history = get_outage_history(start_date=start_date, end_date=end_date)
             total_minutes = sum(
                 o["duration_min"] for h in history for o in h["outages"]
             )
-            avg_per_day = sum(h["count"] for h in history) / days
+            avg_per_day = sum(h["count"] for h in history) / max(days, 1)
             max_day = max((h["count"] for h in history), default=0)
-            html = build_outages_page(history, total_minutes, avg_per_day, max_day, days)
+            html = build_outages_page(history, total_minutes, avg_per_day, max_day, days, range_label)
             self.send_response(200)
             self.send_header("Content-type", "text/html")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
@@ -676,8 +815,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(json.dumps(data).encode("utf-8"))
 
         elif path.startswith("/api/outages"):
-            days = int(params.get("days", "7"))
-            data = get_outage_history(days)
+            start_date, end_date, _, _ = resolve_range(params)
+            data = get_outage_history(start_date=start_date, end_date=end_date)
             self.send_response(200)
             self.send_header("Content-type", "application/json")
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")

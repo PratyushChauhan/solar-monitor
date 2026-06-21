@@ -1,0 +1,14 @@
+[Unit]
+Description=Solar Monitor Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=cipher
+WorkingDirectory=/home/cipher/.openclaw/workspace/solar-monitor
+ExecStart=/usr/bin/python3 /home/cipher/.openclaw/workspace/solar-monitor/dashboard.py --port 8765
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

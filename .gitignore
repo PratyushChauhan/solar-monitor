@@ -1,0 +1,15 @@
+# Ignore logs, secrets, cache
+*.log
+*.pyc
+__pycache__/
+.token
+.env
+
+# Ignore broken/temp files
+dashboard_broken.py
+dashboard_core.pyc
+test_auth.py
+
+# Ignore duplicate service file (keep solar-dashboard.service)
+solar-monitor.service
+solar_data.db

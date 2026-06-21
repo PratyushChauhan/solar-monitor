@@ -221,22 +221,24 @@ def get_day_curve(target_date=None):
 
 
 def get_daily_history(days=14):
-    """Get last N days of daily energy."""
+    """Get last N days of daily energy from live_readings (max energy_today per day)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
-        SELECT date, energy_today
-        FROM daily_summary
-        ORDER BY date DESC
+        SELECT date(timestamp) as day, MAX(energy_today) as max_energy
+        FROM live_readings
+        WHERE date(timestamp) >= date('now', '-{} days')
+        GROUP BY day
+        ORDER BY day DESC
         LIMIT ?
-    """, (days,))
+    """.format(days), (days,))
     rows = cursor.fetchall()
     conn.close()
     
     rows = list(reversed(rows))
-    labels = [r[0][5:] for r in rows]
-    data = [r[1] for r in rows]
+    labels = [r[0][5:] for r in rows]  # MM-DD
+    data = [r[1] or 0 for r in rows]
     return labels, data
 
 
@@ -297,15 +299,22 @@ def get_available_days():
 
 
 def get_weekly_data():
+    """Get weekly energy totals from live_readings (max energy_today per day, summed by week)."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
     cursor.execute("""
         SELECT 
-            strftime('%Y-W%W', date) as week,
-            SUM(energy_today) as weekly_energy
-        FROM daily_summary
-        WHERE date >= date('now', '-30 days')
+            week,
+            SUM(daily_max) as weekly_energy
+        FROM (
+            SELECT 
+                strftime('%Y-W%W', date(timestamp)) as week,
+                MAX(energy_today) as daily_max
+            FROM live_readings
+            WHERE date(timestamp) >= date('now', '-30 days')
+            GROUP BY date(timestamp)
+        )
         GROUP BY week
         ORDER BY week DESC
         LIMIT 4
@@ -315,7 +324,7 @@ def get_weekly_data():
     
     rows = list(reversed(rows))
     labels = [r[0] for r in rows]
-    data = [r[1] for r in rows]
+    data = [r[1] or 0 for r in rows]
     return labels, data
 
 
